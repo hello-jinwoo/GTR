@@ -18,13 +18,13 @@ from .transformer import Transformer
 
 def get_sinusoid_encoding_table(n_seq, d_hidn):
     def cal_angle(position, i_hidn):
-        return position / np.power(10000, 2 * (i_hidn // 2) / d_hidn)
+        return position / 10000 ** (2 * (i_hidn // 2) / d_hidn)
     def get_posi_angle_vec(position):
         return [cal_angle(position, i_hidn) for i_hidn in range(d_hidn)]
 
-    sinusoid_table = np.array([get_posi_angle_vec(i_seq) for i_seq in range(n_seq)])
-    sinusoid_table[:, 0::2] = np.sin(sinusoid_table[:, 0::2])  # even index sin 
-    sinusoid_table[:, 1::2] = np.cos(sinusoid_table[:, 1::2])  # odd index cos
+    sinusoid_table = torch.tensor([get_posi_angle_vec(i_seq) for i_seq in range(n_seq)])
+    sinusoid_table[:, 0::2] = torch.sin(sinusoid_table[:, 0::2])  # even index sin 
+    sinusoid_table[:, 1::2] = torch.cos(sinusoid_table[:, 1::2])  # odd index cos
 
     return sinusoid_table
 
@@ -124,9 +124,7 @@ class GTRROIHeads(CascadeROIHeads):
         if not self.no_pos_emb:
             self.learn_pos_emb_num = 16
             # TODO: device?
-            self.pos_enc = torch.tensor(
-                get_sinusoid_encoding_table(self.learn_pos_emb_num * 4, self.feature_dim // 4)
-            )
+            self.pos_enc = get_sinusoid_encoding_table(self.learn_pos_emb_num * 4, self.feature_dim // 4)
             if self.with_temp_emb:
                 self.learn_temp_emb_num = 16
                 self.temp_emb = nn.Embedding(
