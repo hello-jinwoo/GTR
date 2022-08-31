@@ -342,6 +342,7 @@ class GTRROIHeads(CascadeROIHeads):
         boxes = boxes.view(N, 4)
         boxes = boxes * self.learn_pos_emb_num
 
+        # TODO: device?
         pos_enc = get_sinusoid_encoding_from_boxes(boxes, self.feature_dim // 4) # [N, self.feature_dim]
         return pos_enc
 
