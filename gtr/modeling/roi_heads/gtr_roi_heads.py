@@ -16,6 +16,22 @@ from .custom_fast_rcnn import CustomFastRCNNOutputLayers, custom_fast_rcnn_infer
 from .association_head import ATTWeightHead, FCHead
 from .transformer import Transformer
 
+def get_sinusoid_encoding_from_boxes(boxes, d_hidn):
+    # input: boxes [N, 4]
+    def cal_angle(position, i_hidn):
+        return position / 10000 ** (2 * (i_hidn // 2) / d_hidn)
+    def get_posi_angle_vec(position):
+        return [cal_angle(position, i_hidn) for i_hidn in range(d_hidn)]
+
+    N = boxes.shape[0]
+    boxes = torch.reshape(boxes.clone(), (-1,))
+    sinusoid_table = torch.tensor([get_posi_angle_vec(t) for t in boxes])
+    sinusoid_table[:, 0::2] = torch.sin(sinusoid_table[:, 0::2])  # even index sin 
+    sinusoid_table[:, 1::2] = torch.cos(sinusoid_table[:, 1::2])  # odd index cos
+    sinusoid_table = torch.reshape(sinusoid_table, (N, -1))
+
+    return sinusoid_table
+
 @ROI_HEADS_REGISTRY.register()
 class GTRROIHeads(CascadeROIHeads):
     @configurable
@@ -324,21 +340,10 @@ class GTRROIHeads(CascadeROIHeads):
         '''
         N = boxes.shape[0]
         boxes = boxes.view(N, 4)
-        xywh = torch.cat([
-            (boxes[:, 2:] + boxes[:, :2]) / 2, 
-            (boxes[:, 2:] - boxes[:, :2])], dim=1)
-        xywh = xywh * self.learn_pos_emb_num
-        l = xywh.clamp(min=0, max=self.learn_pos_emb_num - 1).long() # N x 4
-        r = (l + 1).clamp(min=0, max=self.learn_pos_emb_num - 1).long() # N x 4
-        lw = (xywh - l.float()) # N x 4
-        rw = 1. - lw
-        f = self.pos_emb.weight.shape[1]
-        pos_emb_table = self.pos_emb.weight.view(
-            self.learn_pos_emb_num, 4, f) # T x 4 x (F // 4)
-        pos_le = pos_emb_table.gather(0, l[:, :, None].expand(N, 4, f)) # N x 4 x f 
-        pos_re = pos_emb_table.gather(0, r[:, :, None].expand(N, 4, f)) # N x 4 x f
-        pos_emb = lw[:, :, None] * pos_re + rw[:, :, None] * pos_le
-        return pos_emb.view(N, 4 * f)
+        boxes = boxes * self.learn_pos_emb_num
+
+        pos_enc = get_sinusoid_encoding_from_boxes(boxes, self.feature_dim // 4) # [N, self.feature_dim]
+        return pos_enc
 
 
     def _temp_pe(self, temps):
