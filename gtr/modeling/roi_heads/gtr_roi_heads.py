@@ -16,6 +16,39 @@ from .custom_fast_rcnn import CustomFastRCNNOutputLayers, custom_fast_rcnn_infer
 from .association_head import ATTWeightHead, FCHead
 from .transformer import Transformer
 
+def gen_areaembed(boxes, feature_dim): 
+    """ xywh version / mapping position to pre-defined area """
+    x_start, y_start, x_end, y_end = boxes[..., 0, None], boxes[..., 1, None], boxes[..., 2, None], boxes[..., 3, None]
+    x_start = torch.clamp(x_start, min=0, max=1)
+    y_start = torch.clamp(y_start, min=0, max=1)
+    x_end = torch.clamp(x_end, min=0, max=1)
+    y_end = torch.clamp(y_end, min=0, max=1)
+
+    # scale_v5
+    x_coeff = 1 / ((x_end - x_start) * math.pi)
+    y_coeff = 1 / ((y_end - y_start) * math.pi)
+
+    x_theta_1 = 2 * math.pi * x_start
+    x_theta_2 = 2 * math.pi * x_end
+    y_theta_1 = 2 * math.pi * y_start
+    y_theta_2 = 2 * math.pi * y_end
+
+    feature_dim = 256
+    m = torch.arange(feature_dim // 4, dtype=pos_tensor.dtype, device=pos_tensor.device)[None, :] + 1 # degrees for fourier series 
+    x_a_m = x_coeff * ((torch.sin(m * x_theta_2) - torch.sin(m * x_theta_1)) / m)
+    x_b_m = x_coeff * ((torch.cos(m * x_theta_1) - torch.cos(m * x_theta_2)) / m)
+    y_a_m = y_coeff * ((torch.sin(m * y_theta_2) - torch.sin(m * y_theta_1)) / m)
+    y_b_m = y_coeff * ((torch.sin(m * y_theta_1) - torch.sin(m * y_theta_2)) / m)
+
+    # # scale_v7
+    # x_a_m = (x_a_m + 0.15) / 0.3
+    # x_b_m = (x_b_m + 0.15) / 0.3
+    # y_a_m = (y_a_m + 0.15) / 0.3
+    # y_b_m = (y_b_m + 0.15) / 0.3
+
+    ae = torch.cat([x_a_m, x_b_m, y_a_m, y_b_m], dim=-1)
+    return ae
+
 @ROI_HEADS_REGISTRY.register()
 class GTRROIHeads(CascadeROIHeads):
     @configurable
@@ -323,22 +356,12 @@ class GTRROIHeads(CascadeROIHeads):
         '''
         '''
         N = boxes.shape[0]
-        boxes = boxes.view(N, 4)
-        xywh = torch.cat([
-            (boxes[:, 2:] + boxes[:, :2]) / 2, 
-            (boxes[:, 2:] - boxes[:, :2])], dim=1)
-        xywh = xywh * self.learn_pos_emb_num
-        l = xywh.clamp(min=0, max=self.learn_pos_emb_num - 1).long() # N x 4
-        r = (l + 1).clamp(min=0, max=self.learn_pos_emb_num - 1).long() # N x 4
-        lw = (xywh - l.float()) # N x 4
-        rw = 1. - lw
-        f = self.pos_emb.weight.shape[1]
-        pos_emb_table = self.pos_emb.weight.view(
-            self.learn_pos_emb_num, 4, f) # T x 4 x (F // 4)
-        pos_le = pos_emb_table.gather(0, l[:, :, None].expand(N, 4, f)) # N x 4 x f 
-        pos_re = pos_emb_table.gather(0, r[:, :, None].expand(N, 4, f)) # N x 4 x f
-        pos_emb = lw[:, :, None] * pos_re + rw[:, :, None] * pos_le
-        return pos_emb.view(N, 4 * f)
+        boxes = boxes.view(N, 4) # (x1,y1,x2,y3)
+
+        # TODO: device?
+        pos_enc = gen_areaembed(boxes, self.feature_dim)
+
+        return pos_enc
 
 
     def _temp_pe(self, temps):
