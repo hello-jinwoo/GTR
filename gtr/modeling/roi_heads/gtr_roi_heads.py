@@ -2,7 +2,7 @@ import copy
 import torch
 from torch import nn
 import torch.nn.functional as F
-
+ 
 from detectron2.config import configurable
 from detectron2.layers import ShapeSpec
 from detectron2.structures import Boxes, pairwise_iou
@@ -15,6 +15,39 @@ from detectron2.modeling.poolers import ROIPooler
 from .custom_fast_rcnn import CustomFastRCNNOutputLayers, custom_fast_rcnn_inference
 from .association_head import ATTWeightHead, FCHead
 from .transformer import Transformer
+
+
+
+
+def get_sinusoid_encoding_from_boxes(boxes, d_hidn): # sinu_float
+    # input: boxes [N, 4]
+    def cal_angle(position, i_hidn):
+        return position / 10000 ** (2 * (i_hidn // 2) / d_hidn)
+    def get_posi_angle_vec(position):
+        return torch.stack([cal_angle(position, i_hidn) for i_hidn in range(d_hidn)], dim=0)
+
+    N = boxes.shape[0]
+    if N > 0:
+        boxes = torch.reshape(boxes.clone(), (-1,))
+        sinusoid_table = torch.stack([get_posi_angle_vec(t) for t in boxes], dim=0)
+        sinusoid_table[:, 0::2] = torch.sin(sinusoid_table[:, 0::2])  # even index sin 
+        sinusoid_table[:, 1::2] = torch.cos(sinusoid_table[:, 1::2])  # odd index cos
+        sinusoid_table = torch.reshape(sinusoid_table, (N, -1))
+    else:
+        sinusoid_table = torch.zeros(N, d_hidn*4).to(boxes.device) # d_hidn * bbox_dim
+    return sinusoid_table
+
+def get_sinusoid_encoding_table(n_seq, d_hidn): # sinu_table
+    def cal_angle(position, i_hidn):
+        return position / 10000 ** (2 * (i_hidn // 2) / d_hidn)
+    def get_posi_angle_vec(position):
+        return [cal_angle(position, i_hidn) for i_hidn in range(d_hidn)]
+
+    sinusoid_table = torch.tensor([get_posi_angle_vec(i_seq) for i_seq in range(n_seq)])
+    sinusoid_table[:, 0::2] = torch.sin(sinusoid_table[:, 0::2])  # even index sin 
+    sinusoid_table[:, 1::2] = torch.cos(sinusoid_table[:, 1::2])  # odd index cos
+
+    return sinusoid_table
 
 @ROI_HEADS_REGISTRY.register()
 class GTRROIHeads(CascadeROIHeads):
@@ -60,7 +93,10 @@ class GTRROIHeads(CascadeROIHeads):
         self.neg_unmatched = cfg.MODEL.ASSO_HEAD.NEG_UNMATCHED
         self.with_temp_emb = cfg.MODEL.ASSO_HEAD.WITH_TEMP_EMB
         self.no_pos_emb = cfg.MODEL.ASSO_HEAD.NO_POS_EMB
-        
+        self.pe_type =  cfg.MODEL.ASSO_HEAD.PE_TYPE
+        self.learn_pos_emb_num = cfg.MODEL.ASSO_HEAD.PE_NUM 
+
+        assert self.pe_type in ['sinu_float', 'origin', 'sinu_naive']
         self.asso_thresh_test = self.asso_thresh_test \
             if self.asso_thresh_test > 0 else self.asso_thresh_train
 
@@ -110,9 +146,14 @@ class GTRROIHeads(CascadeROIHeads):
         )
         
         if not self.no_pos_emb:
-            self.learn_pos_emb_num = 16
-            self.pos_emb = nn.Embedding(
-                self.learn_pos_emb_num * 4, self.feature_dim // 4)
+            if self.pe_type == 'sinu_float': # no table
+                self.pos_emb = None
+            elif self.pe_type == 'sinu_naive': # table by sinusoidal
+                self.pos_emb = get_sinusoid_encoding_table(self.learn_pos_emb_num * 4, self.feature_dim // 4).cuda().detach() #  not general... just asuuming a single gpu 
+                self.pos_emb.requires_grad_ = False
+            else:  # table by learnable features
+                self.pos_emb = nn.Embedding(
+                    self.learn_pos_emb_num * 4, self.feature_dim // 4)
             if self.with_temp_emb:
                 self.learn_temp_emb_num = 16
                 self.temp_emb = nn.Embedding(
@@ -322,23 +363,36 @@ class GTRROIHeads(CascadeROIHeads):
     def _box_pe(self, boxes):
         '''
         '''
-        N = boxes.shape[0]
-        boxes = boxes.view(N, 4)
-        xywh = torch.cat([
-            (boxes[:, 2:] + boxes[:, :2]) / 2, 
-            (boxes[:, 2:] - boxes[:, :2])], dim=1)
-        xywh = xywh * self.learn_pos_emb_num
-        l = xywh.clamp(min=0, max=self.learn_pos_emb_num - 1).long() # N x 4
-        r = (l + 1).clamp(min=0, max=self.learn_pos_emb_num - 1).long() # N x 4
-        lw = (xywh - l.float()) # N x 4
-        rw = 1. - lw
-        f = self.pos_emb.weight.shape[1]
-        pos_emb_table = self.pos_emb.weight.view(
-            self.learn_pos_emb_num, 4, f) # T x 4 x (F // 4)
-        pos_le = pos_emb_table.gather(0, l[:, :, None].expand(N, 4, f)) # N x 4 x f 
-        pos_re = pos_emb_table.gather(0, r[:, :, None].expand(N, 4, f)) # N x 4 x f
-        pos_emb = lw[:, :, None] * pos_re + rw[:, :, None] * pos_le
-        return pos_emb.view(N, 4 * f)
+        if self.pe_type=='sinu_float':
+            N = boxes.shape[0]
+            boxes = boxes.view(N, 4)
+            boxes = boxes * self.learn_pos_emb_num
+            pos_emb = get_sinusoid_encoding_from_boxes(boxes, self.feature_dim // 4) # [N, self.feature_dim]
+            return pos_emb
+
+        else:
+            N = boxes.shape[0]
+            boxes = boxes.view(N, 4)
+            xywh = torch.cat([
+                (boxes[:, 2:] + boxes[:, :2]) / 2, 
+                (boxes[:, 2:] - boxes[:, :2])], dim=1)
+            xywh = xywh * self.learn_pos_emb_num
+            l = xywh.clamp(min=0, max=self.learn_pos_emb_num - 1).long() # N x 4
+            r = (l + 1).clamp(min=0, max=self.learn_pos_emb_num - 1).long() # N x 4
+            lw = (xywh - l.float()) # N x 4
+            rw = 1. - lw
+            if self.pe_type=='sinu_naive':
+                f = self.pos_emb.shape[1]
+                pos_emb_table = self.pos_emb.view(
+                    self.learn_pos_emb_num, 4, f).detach() # T x 4 x (F // 4)
+            else:
+                f = self.pos_emb.weight.shape[1]
+                pos_emb_table = self.pos_emb.weight.view(
+                    self.learn_pos_emb_num, 4, f) # T x 4 x (F // 4)
+            pos_le = pos_emb_table.gather(0, l[:, :, None].expand(N, 4, f)) # N x 4 x f 
+            pos_re = pos_emb_table.gather(0, r[:, :, None].expand(N, 4, f)) # N x 4 x f
+            pos_emb = lw[:, :, None] * pos_re + rw[:, :, None] * pos_le
+            return pos_emb.view(N, 4 * f)
 
 
     def _temp_pe(self, temps):
